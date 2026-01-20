@@ -1,8 +1,8 @@
 use anyhow::Result;
-use bpm_analyzer::AnalyzerConfig;
+use bpm_analyzer::{AnalyzerConfig, BpmDetection};
 use clap::Parser;
 use crossbeam_channel::Receiver;
-use egui::{CentralPanel, SidePanel};
+use egui::{CentralPanel, Color32, CornerRadius, Pos2, SidePanel, Stroke, Vec2};
 use egui_plotter::EguiBackend;
 use itertools::Itertools;
 use plotters::{
@@ -26,16 +26,22 @@ pub struct BpmApp {
     min_bpm: f32,
     max_bpm: f32,
     data: AllocRingBuffer<(f32, f32)>,
-    receiver: Receiver<[(f32, f32); 5]>,
+    receiver: Receiver<BpmDetection>,
+    last_beat_timestamp: Option<f64>,
+    beat_pulse_strength: f32,
+    last_detection: Option<BpmDetection>,
 }
 
 impl BpmApp {
-    pub fn new(min_bpm: f32, max_bpm: f32, receiver: Receiver<[(f32, f32); 5]>) -> Self {
+    pub fn new(min_bpm: f32, max_bpm: f32, receiver: Receiver<BpmDetection>) -> Self {
         Self {
             min_bpm,
             max_bpm,
             data: AllocRingBuffer::new(256),
             receiver,
+            last_beat_timestamp: None,
+            beat_pulse_strength: 0.0,
+            last_detection: None,
         }
     }
 }
@@ -44,10 +50,36 @@ impl eframe::App for BpmApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
 
-        self.data
-            .extend(self.receiver.try_iter().flat_map(|arr| arr.into_iter()));
+        // Process incoming detections
+        for detection in self.receiver.try_iter() {
+            self.data.extend(
+                detection.candidates().iter().map(|c| (c.bpm, c.confidence)).collect::<Vec<_>>()
+            );
+            
+            // Check for new beat using audio timestamp
+            if let Some(last_beat) = detection.last_beat() {
+                if let Some(prev_timestamp) = self.last_beat_timestamp {
+                    // Only trigger pulse if this is a new beat (different timestamp)
+                    if (last_beat.time_seconds - prev_timestamp).abs() > 0.05 {
+                        self.last_beat_timestamp = Some(last_beat.time_seconds);
+                        self.beat_pulse_strength = last_beat.strength.min(1.0);
+                    }
+                } else {
+                    self.last_beat_timestamp = Some(last_beat.time_seconds);
+                    self.beat_pulse_strength = last_beat.strength.min(1.0);
+                }
+            }
+            
+            self.last_detection = Some(detection);
+        }
 
-        SidePanel::right("right_panel").show(ctx, |ui| {
+        // Decay beat pulse smoothly (faster decay, with cutoff)
+        self.beat_pulse_strength *= 0.85;
+        if self.beat_pulse_strength < 0.01 {
+            self.beat_pulse_strength = 0.0;
+        }
+
+        SidePanel::right("right_panel").min_width(200.0).show(ctx, |ui| {
             let peaks = self
                 .data
                 .iter()
@@ -61,8 +93,109 @@ impl eframe::App for BpmApp {
 
             peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+            ui.heading("BPM Detection");
+            ui.separator();
+
             if let Some((bpm, _)) = peaks.first() {
-                ui.label(format!("{bpm} BPM"));
+                ui.label(egui::RichText::new(format!("{bpm} BPM"))
+                    .size(48.0)
+                    .strong());
+            } else {
+                ui.label(egui::RichText::new("-- BPM")
+                    .size(48.0)
+                    .weak());
+            }
+
+            ui.add_space(20.0);
+
+            // Beat timing section
+            if let Some(detection) = &self.last_detection {
+                ui.heading("Beat Timing");
+                ui.separator();
+
+                if let Some(last_beat) = detection.last_beat() {
+                    ui.label(format!("Last Beat: {:.2}s", last_beat.time_seconds));
+                    ui.label(format!("Strength: {:.2}", last_beat.strength));
+                    
+                    if let Some(interval) = detection.last_beat_interval() {
+                        let instant_bpm = 60.0 / interval;
+                        ui.label(format!("Interval: {:.3}s", interval));
+                        ui.label(egui::RichText::new(format!("Instant BPM: {:.1}", instant_bpm))
+                            .color(Color32::from_rgb(100, 150, 255)));
+                    }
+                } else {
+                    ui.label(egui::RichText::new("Waiting for beats...")
+                        .weak());
+                }
+
+                ui.add_space(10.0);
+                
+                // Beat pulse indicator
+                let pulse_size = 80.0 + self.beat_pulse_strength * 40.0;
+                let pulse_alpha = (self.beat_pulse_strength * 255.0) as u8;
+                let (rect, _response) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 120.0),
+                    egui::Sense::hover(),
+                );
+                
+                let center = rect.center();
+                let radius = pulse_size / 2.0;
+                
+                ui.painter().circle(
+                    center,
+                    radius,
+                    Color32::from_rgba_unmultiplied(100, 150, 255, pulse_alpha),
+                    Stroke::new(2.0, Color32::from_rgb(100, 150, 255)),
+                );
+                
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "♪",
+                    egui::FontId::proportional(40.0),
+                    Color32::WHITE,
+                );
+
+                ui.add_space(10.0);
+
+                // Beat history timeline
+                let beat_count = detection.beat_timings().len();
+                if beat_count > 1 {
+                    ui.label(format!("Recent Beats: {}", beat_count));
+                    
+                    let timeline_height = 60.0;
+                    let (timeline_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), timeline_height),
+                        egui::Sense::hover(),
+                    );
+                    
+                    // Draw timeline background
+                    ui.painter().rect_filled(
+                        timeline_rect,
+                        CornerRadius::same(4),
+                        Color32::from_gray(40),
+                    );
+                    
+                    // Get beat timings
+                    let beats = detection.beat_timings();
+                    if let (Some(first), Some(last)) = (beats.first(), beats.last()) {
+                        let time_range = (last.time_seconds - first.time_seconds).max(0.1);
+                        
+                        // Draw beats
+                        for beat in beats {
+                            let normalized_time = (beat.time_seconds - first.time_seconds) / time_range;
+                            let x = timeline_rect.left() + (normalized_time as f32) * timeline_rect.width();
+                            let y = timeline_rect.center().y;
+                            
+                            let beat_radius = 4.0 + beat.strength * 4.0;
+                            ui.painter().circle_filled(
+                                Pos2::new(x, y),
+                                beat_radius,
+                                Color32::from_rgb(100, 200, 255),
+                            );
+                        }
+                    }
+                }
             }
         });
 

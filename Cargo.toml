@@ -1,6 +1,6 @@
 [package]
 name = "bpm-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/not-jan/bpm-analyzer"
@@ -9,6 +9,7 @@ homepage = "https://github.com/not-jan/bpm-analyzer"
 keywords = ["audio", "dsp", "music"]
 categories = ["multimedia::audio"]
 description = "A simple library for calculating the BPM"
+documentation = "https://docs.rs/bpm-analyzer/latest/bpm_analyzer/"
 
 [[bin]]
 path = "src/bin/app.rs"

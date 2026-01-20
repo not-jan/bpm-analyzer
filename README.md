@@ -12,8 +12,9 @@ The BPM analyzer uses a sophisticated multi-stage signal processing pipeline:
 2. **Resampling**: Downsamples to 22.05 kHz for efficient processing
 3. **Wavelet Decomposition**: Applies 4-level Daubechies D4 wavelet transform to separate frequency bands
 4. **Onset Detection**: Extracts amplitude envelopes from each band using full-wave rectification and low-pass filtering
-5. **Autocorrelation**: Computes autocorrelation on the summed envelopes to find periodic patterns
-6. **Peak Detection**: Identifies BPM candidates based on autocorrelation peaks within the specified range
+5. **Beat Detection**: Identifies individual beats using onset strength analysis
+6. **Autocorrelation**: Computes autocorrelation on the summed envelopes to find periodic patterns
+7. **Peak Detection**: Identifies BPM candidates based on autocorrelation peaks within the specified range
 
 ## Installation
 
@@ -38,19 +39,50 @@ fn main() -> Result<(), bpm_analyzer::Error> {
         .max_bpm(180.0)
         .build();
 
-    // Start the analyzer
+    // Start the analyzer with default device
     let bpm_receiver = begin(config)?;
 
-    // Process BPM candidates
-    for peaks in bpm_receiver.iter() {
-        // peaks is an array of 5 (bpm, confidence) tuples
-        // sorted by confidence (highest first)
-        if let Some((bpm, confidence)) = peaks.first() {
-            println!("Detected BPM: {:.1} (confidence: {:.4})", bpm, confidence);
+    // Process BPM detections
+    for detection in bpm_receiver.iter() {
+        if let Some(bpm) = detection.bpm() {
+            println!("Detected BPM: {:.1}", bpm);
+        }
+        
+        // Access beat timings
+        for beat in detection.beat_timings() {
+            println!("Beat at {:.2}s (strength: {:.2})", beat.time_seconds, beat.strength);
+        }
+        
+        // Get the interval between last two beats
+        if let Some(interval) = detection.last_beat_interval() {
+            println!("Last beat interval: {:.3}s", interval);
         }
     }
 
     Ok(())
+}
+```
+
+#### Selecting a Specific Audio Device
+
+```rust
+use bpm_analyzer::{AnalyzerConfig, begin_with_device, list_audio_devices, get_device_by_name};
+
+// List all available devices
+let devices = list_audio_devices()?;
+for device in &devices {
+    println!("{} {}", device.name, if device.is_default { "(default)" } else { "" });
+}
+
+// Use a specific device by name
+let config = AnalyzerConfig::electronic();
+let device = get_device_by_name("BlackHole 2ch")?;
+let receiver = begin_with_device(config, &device)?;
+
+for detection in receiver.iter() {
+    if let Some(bpm) = detection.bpm() {
+        println!("Detected BPM: {:.1}", bpm);
+    }
 }
 ```
 
