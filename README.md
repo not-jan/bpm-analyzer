@@ -63,6 +63,32 @@ fn main() -> Result<(), bpm_analyzer::Error> {
 }
 ```
 
+#### Analyzing Your Own Audio
+
+If the audio is not coming from an input device (e.g. you are decoding a file or tapping the
+samples a player is playing), feed interleaved stereo frames into the analyzer yourself:
+
+```rust
+use bpm_analyzer::{AnalyzerConfig, begin_with_receiver, bounded};
+
+// frames come from your own decoder/player, here 44.1 kHz
+let (sender, frames) = bounded(1 << 16);
+let detections = begin_with_receiver(AnalyzerConfig::electronic(), 44_100, frames)?;
+
+// elsewhere: sender.try_send((left, right)) for every frame (mono: send the same value twice)
+
+for detection in detections.iter() {
+    if let Some(bpm) = detection.bpm() {
+        println!("Detected BPM: {:.1}", bpm);
+    }
+}
+```
+
+The analysis thread ends on its own once the sender is dropped (and the queue is drained) or the
+detections receiver is dropped. It sleeps while no samples arrive and re-analyses after
+`window_size / 8` new samples, so it does not occupy a CPU core. Supported sample rates are 16,
+22.05, 32, 44.1, 48, 88.2, 96, 176.4 and 192 kHz. See `examples/analyze_samples.rs`.
+
 #### Selecting a Specific Audio Device
 
 ```rust

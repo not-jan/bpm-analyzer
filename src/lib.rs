@@ -10,6 +10,8 @@
 //! - Multi-band envelope analysis
 //! - Autocorrelation-based tempo estimation
 //! - Configurable BPM range and analysis parameters
+//! - Analysis of audio you feed in yourself (e.g. the samples a player is playing),
+//!   see [`begin_with_receiver`]
 //!
 //! ## Example
 //!
@@ -42,9 +44,9 @@ pub mod error;
 pub mod types;
 
 // Re-exports for public API
-pub use analyzer::{begin, begin_with_device};
+pub use analyzer::{begin, begin_with_device, begin_with_receiver};
 pub use config::AnalyzerConfig;
-pub use crossbeam_channel::Receiver;
+pub use crossbeam_channel::{Receiver, Sender, bounded};
 pub use device::{AudioDevice, get_default_device, get_device_by_name, list_audio_devices};
 pub use error::{Error, Result};
 pub use types::{BeatTiming, BpmCandidate, BpmDetection};

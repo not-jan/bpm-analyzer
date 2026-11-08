@@ -4,7 +4,7 @@ use cpal::{
     BufferSize, FromSample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use fundsp::prelude32::*;
 use osclet::{BorderMode, DaubechiesFamily, Osclet};
 use resampler::{Attenuation, Latency, ResamplerFir, SampleRate};
@@ -197,7 +197,80 @@ pub fn begin_with_device(
         }
     }
 
-    std::thread::spawn(move || run_analysis(sample_rate, audio_receiver, bpm_sender, config));
+    // hop = 0: analyse on every pass, as before
+    std::thread::spawn(move || run_analysis(sample_rate, audio_receiver, bpm_sender, config, 0));
+
+    Ok(bpm_receiver)
+}
+
+/// Maps a sample rate to the resampler's supported rates.
+fn supported_sample_rate(rate: u32) -> Result<SampleRate> {
+    Ok(match rate {
+        16000 => SampleRate::Hz16000,
+        22050 => SampleRate::Hz22050,
+        32000 => SampleRate::Hz32000,
+        44100 => SampleRate::Hz44100,
+        48000 => SampleRate::Hz48000,
+        88200 => SampleRate::Hz88200,
+        96000 => SampleRate::Hz96000,
+        176400 => SampleRate::Hz176400,
+        192000 => SampleRate::Hz192000,
+        _ => return Err(Error::UnsupportedSampleRate(rate)),
+    })
+}
+
+/// Starts the analyzer on audio that the caller feeds in, instead of
+/// capturing from an input device. Send interleaved stereo frames `(left, right)` at
+/// `sample_rate` into the channel belonging to `audio_receiver`; mono sources should
+/// send the same value twice.
+///
+/// The analysis thread ends by itself once the sender side is dropped (and the queue is
+/// drained) or the returned receiver is dropped. It sleeps while no samples arrive and
+/// re-analyses only after `window_size / 8` new (resampled) samples, so it does not
+/// hog a CPU core while a song plays.
+///
+/// # Errors
+///
+/// Returns an error if the configuration is invalid or `sample_rate` is not one of
+/// the supported rates (16, 22.05, 32, 44.1, 48, 88.2, 96, 176.4, 192 kHz).
+///
+/// # Example
+///
+/// ```no_run
+/// use bpm_analyzer::{AnalyzerConfig, begin_with_receiver, bounded};
+///
+/// // Frames come from your own decoder/player, e.g. 44.1 kHz stereo.
+/// let (sender, frames) = bounded(1 << 16);
+/// let detections = begin_with_receiver(AnalyzerConfig::electronic(), 44_100, frames)?;
+///
+/// std::thread::spawn(move || {
+///     for (left, right) in [(0.0f32, 0.0f32); 44_100 * 10] {
+///         let _ = sender.send((left, right));
+///     }
+///     // dropping `sender` ends the analysis
+/// });
+///
+/// for detection in detections.iter() {
+///     if let Some(bpm) = detection.bpm() {
+///         println!("Detected BPM: {:.1}", bpm);
+///     }
+/// }
+/// # Ok::<(), bpm_analyzer::Error>(())
+/// ```
+pub fn begin_with_receiver(
+    config: AnalyzerConfig,
+    sample_rate: u32,
+    audio_receiver: Receiver<(f32, f32)>,
+) -> Result<Receiver<BpmDetection>> {
+    config.validate()?;
+    supported_sample_rate(sample_rate)?;
+
+    let (bpm_sender, bpm_receiver) = bounded(config.queue_size());
+    let hop = config.window_size() / 8;
+
+    std::thread::spawn(move || {
+        run_analysis(sample_rate as f64, audio_receiver, bpm_sender, config, hop)
+    });
 
     Ok(bpm_receiver)
 }
@@ -223,24 +296,14 @@ fn run_analysis(
     audio_receiver: Receiver<(f32, f32)>,
     bpm_sender: Sender<BpmDetection>,
     config: AnalyzerConfig,
+    hop_samples: usize,
 ) -> Result<()> {
     let now = std::time::Instant::now();
 
     let dwt_executor = Osclet::make_daubechies_f32(DaubechiesFamily::Db4, BorderMode::Wrap);
 
     // Create resampler based on actual sample rate
-    let input_sample_rate = match sample_rate as u32 {
-        16000 => SampleRate::Hz16000,
-        22050 => SampleRate::Hz22050,
-        32000 => SampleRate::Hz32000,
-        44100 => SampleRate::Hz44100,
-        48000 => SampleRate::Hz48000,
-        88200 => SampleRate::Hz88200,
-        96000 => SampleRate::Hz96000,
-        176400 => SampleRate::Hz176400,
-        192000 => SampleRate::Hz192000,
-        _ => return Err(Error::UnsupportedSampleRate(sample_rate as u32)),
-    };
+    let input_sample_rate = supported_sample_rate(sample_rate as u32)?;
 
     let mut resampler = ResamplerFir::new(
         1,
@@ -288,15 +351,34 @@ fn run_analysis(
     let mut samples_processed = 0usize;
     let mut current_bpm: Option<f32> = None;
 
+    // resampled samples since the last analysis (see `hop_samples`)
+    let mut new_since_analysis = 0usize;
+
     loop {
         // Read all available audio samples from the channel
         input_buffer.clear();
-        input_buffer.extend(
-            audio_receiver
-                .try_iter()
+        let mut disconnected = false;
+        loop {
+            match audio_receiver.try_recv() {
                 // Mix to mono
-                .map(|(l, r)| (l + r) * 0.5),
-        );
+                Ok((l, r)) => input_buffer.push((l + r) * 0.5),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // nothing new -> end if the sender is gone, else wait a moment
+        // instead of spinning
+        if input_buffer.is_empty() {
+            if disconnected {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
 
         let mut input_slice = &input_buffer[..];
 
@@ -306,11 +388,13 @@ fn run_analysis(
                 .map_err(Error::ResampleError)?;
             ring_buffer.extend(resampled_output[..produced].iter().copied());
             samples_processed += produced;
+            new_since_analysis += produced;
 
             input_slice = &input_slice[consumed..];
         }
 
-        if ring_buffer.is_full() {
+        if ring_buffer.is_full() && new_since_analysis >= hop_samples {
+            new_since_analysis = 0;
             once.call_once(|| {
                 let time = now.elapsed();
                 tracing::info!(
@@ -515,8 +599,17 @@ fn run_analysis(
                     current_bpm = Some(result[0].0);
                 }
 
-                let _ = bpm_sender.try_send(BpmDetection::with_beats(result, beat_timings.clone()));
+                // stop when nobody listens to the results any more
+                if let Err(TrySendError::Disconnected(_)) =
+                    bpm_sender.try_send(BpmDetection::with_beats(result, beat_timings.clone()))
+                {
+                    return Ok(());
+                }
             }
+        }
+
+        if disconnected {
+            return Ok(());
         }
     }
 }
